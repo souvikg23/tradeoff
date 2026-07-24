@@ -1,0 +1,18 @@
+# VQC depth-width study — Python dependencies
+#
+# Tested with Python 3.12. Should work on 3.10+.
+# Versions are pinned to compatible minor ranges, not exact patch numbers,
+# so you don't get stuck if PyPI ever rotates a specific patch.
+
+# Core quantum simulation
+pennylane>=0.40,<0.46
+
+# Numerics
+numpy>=1.26,<3.0
+scipy>=1.11,<2.0
+
+# Data handling
+pandas>=2.0,<3.1
+
+# Plotting
+matplotlib>=3.7,<4.0
