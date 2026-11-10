@@ -31,6 +31,10 @@ import os
 import time
 import warnings
 
+# One BLAS thread per worker process; otherwise 4 workers x N threads oversubscribe the CPUs.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 import pandas as pd
 
@@ -112,7 +116,7 @@ def run_cell(task):
 def build_tasks(args):
     tasks = []
     if args.group == "noisy":
-        ns = range(2, (5 if args.quick else 6) + 1)
+        ns = range(2, (min(5, args.nmax_noisy) if args.quick else args.nmax_noisy) + 1)
         Ls = [1, 4, 8] if args.quick else range(1, 9)
         for a in TOPOS:
             for noise in NOISES:
@@ -139,6 +143,9 @@ def main():
     ap.add_argument("--nmax", type=int, default=10)
     ap.add_argument("--quick", action="store_true", help="small preview grid")
     ap.add_argument("--procs", type=int, default=max(1, mp.cpu_count() - 1))
+    ap.add_argument("--max-hours", type=float, default=0,
+                    help="stop cleanly after this many hours (0 = no limit); rerun to resume")
+    ap.add_argument("--nmax-noisy", type=int, default=6)
     args = ap.parse_args()
     if args.quick and args.runs == 20:
         args.runs, args.samples = 5, 30
@@ -155,13 +162,26 @@ def main():
     print(f"{len(tasks)} cells to run ({len(done)} already done), {args.procs} processes", flush=True)
 
     t0 = time.time()
-    with mp.Pool(args.procs) as pool:
+    stopped = False
+    pool = mp.Pool(args.procs)
+    try:
         for i, rows in enumerate(pool.imap_unordered(run_cell, tasks, chunksize=1), 1):
             pd.DataFrame(rows).to_csv(cells, mode="a", header=not os.path.exists(cells), index=False)
+            el = time.time() - t0
             if i % 10 == 0 or i == len(tasks):
-                el = time.time() - t0
                 print(f"[{i}/{len(tasks)}] {el/60:.1f} min elapsed, eta {el/i*(len(tasks)-i)/60:.1f} min", flush=True)
-    print("done:", cells)
+            if args.max_hours and el > args.max_hours * 3600:
+                stopped = True
+                print(f"Time budget of {args.max_hours} h reached after {i} cells; "
+                      f"saved results are kept. Run again to continue.", flush=True)
+                break
+    finally:
+        if stopped:
+            pool.terminate()
+        else:
+            pool.close()
+        pool.join()
+    print(("stopped early: " if stopped else "done: ") + cells, flush=True)
 
 
 if __name__ == "__main__":
