@@ -1,11 +1,18 @@
 """
 metrics.py
 ==========
-Five metrics. Use apply_layer_noise() to inject noise at the end of every layer,
-so any noise preset registered in noise.py works automatically.
+Metrics. Noise is injected at the end of EVERY layer through the ansatz
+``layer_hook`` (fixed Nov 2026: it was previously applied once after the whole
+circuit), so any noise preset registered in noise.py works automatically.
 
 Metrics:
-    haar_kl_divergence       : KL from Haar fidelity distribution.
+    haar_kl_divergence       : KL from the Haar fidelity distribution. Default
+                               reference is the REAL (orthogonal) ensemble, since
+                               RY + CNOT/CZ circuits only produce real states.
+    frame_potential_ratio    : second frame potential / real-Haar value (>= 1;
+                               -> 1 for a real 2-design). Does not saturate.
+    gradient_variance_all    : Var of dC/dtheta_k averaged over ALL parameters,
+                               with cost "z0" (<Z_0>) or "local" (mean_i <Z_i>).
     effective_kernel_rank    : effective rank of empirical kernel matrix.
     gradient_variance        : variance of d<Z_0>/dtheta_0 over random params.
     function_output_variance : variance of circuit output over random inputs.
@@ -19,6 +26,13 @@ from scipy.stats import entropy
 
 from ansatze import ANSATZE, ANSATZE_WITH_DATA, n_params
 from noise import make_device, NOISE_PRESETS, apply_layer_noise, is_noiseless
+
+
+def _hook(noise_preset, n_qubits):
+    """Per-layer noise hook, or None for noiseless runs."""
+    if is_noiseless(noise_preset):
+        return None
+    return lambda: apply_layer_noise(noise_preset, n_qubits)
 
 
 # ---------------------------------------------------------------------------
@@ -35,10 +49,11 @@ def _make_state_qnode(ansatz_name, n_qubits, n_layers, noise_preset):
             return qml.state()
         return circuit, "pure"
 
+    hook = _hook(noise_preset, n_qubits)
+
     @qml.qnode(dev)
     def circuit(params):
-        ansatz(params, n_qubits, n_layers)
-        apply_layer_noise(noise_preset, n_qubits)
+        ansatz(params, n_qubits, n_layers, layer_hook=hook)
         return qml.density_matrix(wires=range(n_qubits))
     return circuit, "mixed"
 
@@ -49,10 +64,11 @@ def _make_expval_qnode(ansatz_name, n_qubits, n_layers, noise_preset, observable
     if observable is None:
         observable = qml.PauliZ(0)
 
+    hook = _hook(noise_preset, n_qubits)
+
     @qml.qnode(dev, interface="autograd")
     def circuit(params):
-        ansatz(params, n_qubits, n_layers)
-        apply_layer_noise(noise_preset, n_qubits)
+        ansatz(params, n_qubits, n_layers, layer_hook=hook)
         return qml.expval(observable)
     return circuit
 
@@ -66,10 +82,11 @@ def _make_data_qnode(ansatz_name, n_qubits, n_layers, noise_preset):
     ansatz = ANSATZE_WITH_DATA[ansatz_name]
     dev = make_device(n_qubits, noise_preset)
 
+    hook = _hook(noise_preset, n_qubits)
+
     @qml.qnode(dev, interface="autograd")
     def circuit(x, params):
-        ansatz(x, params, n_qubits, n_layers)
-        apply_layer_noise(noise_preset, n_qubits)
+        ansatz(x, params, n_qubits, n_layers, layer_hook=hook)
         return qml.expval(qml.PauliZ(0))
     return circuit
 
@@ -89,10 +106,11 @@ def _make_data_state_qnode(ansatz_name, n_qubits, n_layers, noise_preset):
             return qml.state()
         return circuit
 
+    hook = _hook(noise_preset, n_qubits)
+
     @qml.qnode(dev)
     def circuit(x, params):
-        ansatz(x, params, n_qubits, n_layers)
-        apply_layer_noise(noise_preset, n_qubits)
+        ansatz(x, params, n_qubits, n_layers, layer_hook=hook)
         return qml.density_matrix(wires=range(n_qubits))
     return circuit
 
@@ -112,6 +130,23 @@ def _haar_fidelities_pure(n_qubits, n_pairs, rng):
     return fids
 
 
+def _haar_fidelities_real(n_qubits, n_pairs, rng):
+    """Fidelities between independent random REAL unit vectors (orthogonal
+    ensemble). Distribution is Beta(1/2, (d-1)/2), mean 1/d."""
+    dim = 2 ** n_qubits
+    a = rng.normal(size=(n_pairs, dim))
+    b = rng.normal(size=(n_pairs, dim))
+    a /= np.linalg.norm(a, axis=1, keepdims=True)
+    b /= np.linalg.norm(b, axis=1, keepdims=True)
+    return np.einsum("ij,ij->i", a, b) ** 2
+
+
+def haar_frame_potential(n_qubits, real=True):
+    """Second frame potential E[F^2] of the Haar ensemble."""
+    d = 2 ** n_qubits
+    return 3.0 / (d * (d + 2)) if real else 2.0 / (d * (d + 1))
+
+
 def _fidelity(state_a, state_b, mode):
     if mode == "pure":
         return float(np.abs(np.vdot(state_a, state_b)) ** 2)
@@ -122,7 +157,7 @@ def _fidelity(state_a, state_b, mode):
 # Metric 1: Haar KL
 # ---------------------------------------------------------------------------
 def haar_kl_divergence(ansatz_name, n_qubits, n_layers, noise_preset="noiseless",
-                       n_samples=60, n_bins=50, seed=0):
+                       n_samples=60, n_bins=50, seed=0, reference="real"):
     rng = np.random.default_rng(seed)
     qnode, mode = _make_state_qnode(ansatz_name, n_qubits, n_layers, noise_preset)
     n_p = n_params(n_qubits, n_layers)
@@ -134,7 +169,10 @@ def haar_kl_divergence(ansatz_name, n_qubits, n_layers, noise_preset="noiseless"
 
     pairs = list(itertools.combinations(range(n_samples), 2))
     vqc_fids = np.array([_fidelity(states[i], states[j], mode) for i, j in pairs])
-    haar_fids = _haar_fidelities_pure(n_qubits, len(pairs), rng)
+    if reference == "real":
+        haar_fids = _haar_fidelities_real(n_qubits, len(pairs), rng)
+    else:
+        haar_fids = _haar_fidelities_pure(n_qubits, len(pairs), rng)
 
     edges = np.linspace(0, 1, n_bins + 1)
     h_vqc, _ = np.histogram(vqc_fids, bins=edges, density=False)
@@ -144,6 +182,20 @@ def haar_kl_divergence(ansatz_name, n_qubits, n_layers, noise_preset="noiseless"
     h_vqc /= h_vqc.sum()
     h_haar /= h_haar.sum()
     return float(entropy(h_vqc, h_haar))
+
+
+def frame_potential_ratio(ansatz_name, n_qubits, n_layers, noise_preset="noiseless",
+                          n_samples=60, seed=0, reference="real"):
+    """Second frame potential of the circuit ensemble divided by the Haar value.
+    Ratio >= 1 (up to sampling error); 1 means the ensemble matches a 2-design.
+    Unlike the binned KL, this does not saturate at large n."""
+    rng = np.random.default_rng(seed)
+    qnode, mode = _make_state_qnode(ansatz_name, n_qubits, n_layers, noise_preset)
+    n_p = n_params(n_qubits, n_layers)
+    states = [qnode(rng.uniform(0, 2 * np.pi, size=n_p)) for _ in range(n_samples)]
+    fids = np.array([_fidelity(states[i], states[j], mode)
+                     for i, j in itertools.combinations(range(n_samples), 2)])
+    return float(np.mean(fids ** 2) / haar_frame_potential(n_qubits, real=(reference == "real")))
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +258,36 @@ def gradient_variance(ansatz_name, n_qubits, n_layers, noise_preset="noiseless",
         g0_samples.append(float(g[0]))
 
     return float(np.var(g0_samples))
+
+
+def gradient_variance_all(ansatz_name, n_qubits, n_layers, noise_preset="noiseless",
+                          n_samples=50, seed=0, cost="z0"):
+    """
+    Var_theta[dC/dtheta_k] averaged over ALL k (not just theta_0).
+    cost = "z0"    : C = <Z_0>
+    cost = "local" : C = (1/n) sum_i <Z_i>   (standard local cost)
+    Returns dict with mean over parameters, min and max over parameters.
+    """
+    from pennylane import numpy as pnp
+
+    rng = np.random.default_rng(seed)
+    n_p = n_params(n_qubits, n_layers)
+    if cost == "z0":
+        obs = qml.PauliZ(0)
+    elif cost == "local":
+        obs = qml.Hamiltonian([1.0 / n_qubits] * n_qubits,
+                              [qml.PauliZ(q) for q in range(n_qubits)])
+    else:
+        raise ValueError(cost)
+    qnode = _make_expval_qnode(ansatz_name, n_qubits, n_layers, noise_preset, observable=obs)
+    grad_fn = qml.grad(qnode, argnums=0)
+
+    G = np.empty((n_samples, n_p))
+    for s in range(n_samples):
+        params = pnp.array(rng.uniform(0, 2 * np.pi, size=n_p), requires_grad=True)
+        G[s] = np.array(grad_fn(params), dtype=float)
+    v = G.var(axis=0)
+    return {"mean": float(v.mean()), "min": float(v.min()), "max": float(v.max())}
 
 
 # ---------------------------------------------------------------------------

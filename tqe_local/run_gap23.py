@@ -84,7 +84,9 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # -----------------------------------------------------------------------
 def _rzryrz_layer(params, n_qubits, idx):
     """
-    RZ(t1) RY(t2) RZ(t3) on every qubit.
+    NOTE (Nov 2026 audit): the code applies RX-RY-RZ, not RZ-RY-RZ as the name
+    and the module docstring say. Decide which one the paper describes and make
+    the code and the text agree before reusing these results.
     Uses 3 parameters per qubit per layer.
     Returns updated idx.
     """
@@ -154,7 +156,10 @@ def build_circuit(ansatz_name, n_qubits, n_layers, device_name,
     else:
         dev = qml.device("default.mixed", wires=n_qubits)
 
-    noise_ops = NOISE_PRESETS.get(noise_preset, [])
+    from noise import apply_layer_noise
+    # FIX (Nov 2026): NOISE_PRESETS holds {"kind", "rate"} dicts, not
+    # (fn, kwargs) pairs. The old loop raised on every noisy cell, the error was
+    # swallowed, and the noisy sweep wrote no rows at all.
 
     @qml.qnode(dev, interface="autograd")
     def circuit(params):
@@ -162,11 +167,8 @@ def build_circuit(ansatz_name, n_qubits, n_layers, device_name,
             idx_start = layer * 3 * n_qubits
             _rzryrz_layer(params, n_qubits, idx_start)
             _ent_layer(ansatz_name, n_qubits, layer)
-            # Apply noise after entangling layer (noisy runs only)
             if noise_preset != "noiseless":
-                for q in range(n_qubits):
-                    for noise_fn, noise_kwargs in noise_ops:
-                        noise_fn(wires=q, **noise_kwargs)
+                apply_layer_noise(noise_preset, n_qubits)
         return qml.expval(qml.PauliZ(0))
 
     return circuit

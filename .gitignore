@@ -1,3 +1,4 @@
 
 files/.venv/
-tqe_local/tqe/
+tqe_local/tqe/__pycache__/
+tqe_local/outputs_fixed/
